@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from typing import Dict, List, Optional, Union
 
 import fitz  # PyMuPDF
@@ -79,6 +80,10 @@ def ocr_image_bytes(
         The OCR engine instance used to perform inference.
     image_bytes : bytes
         Encoded image data (PNG or JPEG) used as input.
+    min_conf : float
+        Minimum confidence threshold for filtering results
+    detect_headings : bool
+        Whether to apply heading detection
 
     Returns
     -------
@@ -86,20 +91,57 @@ def ocr_image_bytes(
         The recognised text lines. Lines with no recognised text are
         filtered out.
     """
+    start_time = time.time()
+    logger.info(f"Starting OCR on image bytes (size: {len(image_bytes)} bytes)")
+    
     if not engine.available:
-        raise RuntimeError("OCR engine unavailable")
+        error_msg = "OCR engine unavailable"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    arr = np.array(image)
-    results = engine.image_to_lines(arr)
-    filtered = [
-        text.strip()
-        for text, conf in results
-        if text.strip() and conf >= min_conf
-    ]
-    if not detect_headings:
-        return filtered
-    return _DETECT_HEADINGS_FN(filtered)
+    try:
+        # Load and convert image
+        load_start = time.time()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        arr = np.array(image)
+        load_elapsed = time.time() - load_start
+        logger.info(f"Image loaded and converted to array in {load_elapsed:.3f}s - shape: {arr.shape}")
+        
+        # Run OCR
+        ocr_start = time.time()
+        results = engine.image_to_lines(arr)
+        ocr_elapsed = time.time() - ocr_start
+        logger.info(f"OCR completed in {ocr_elapsed:.3f}s - got {len(results)} raw results")
+        
+        # Filter by confidence
+        filter_start = time.time()
+        filtered = [
+            text.strip()
+            for text, conf in results
+            if text.strip() and conf >= min_conf
+        ]
+        filtered_count = len(results) - len(filtered)
+        filter_elapsed = time.time() - filter_start
+        logger.info(f"Filtered {filtered_count} lines below confidence {min_conf} in {filter_elapsed:.3f}s")
+        
+        # Apply heading detection if requested
+        if detect_headings:
+            heading_start = time.time()
+            processed = _DETECT_HEADINGS_FN(filtered)
+            heading_elapsed = time.time() - heading_start
+            logger.info(f"Heading detection completed in {heading_elapsed:.3f}s")
+            result = processed
+        else:
+            result = filtered
+        
+        total_elapsed = time.time() - start_time
+        logger.info(f"Total ocr_image_bytes processing time: {total_elapsed:.3f}s - returned {len(result)} lines")
+        return result
+        
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        logger.error(f"Error in ocr_image_bytes after {elapsed:.3f}s: {exc}", exc_info=True)
+        raise
 
 
 def pdf_to_pages(
@@ -126,47 +168,123 @@ def pdf_to_pages(
         compatibility).
     file_bytes : bytes
         Raw bytes of the PDF file.
+    dpi : int
+        DPI for rasterization when OCR is needed
+    min_conf : float
+        Minimum confidence threshold
+    detect_headings : bool
+        Whether to detect headings
+    force_ocr : bool
+        Force OCR even if text layer exists
+    select_pages : Optional[List[int]]
+        Specific page indices to process (None = all pages)
 
     Returns
     -------
     List[str]
         A list of extracted page texts with heading markers applied.
     """
+    start_time = time.time()
+    logger.info(f"Starting PDF processing (size: {len(file_bytes)} bytes, force_ocr: {force_ocr}, dpi: {dpi})")
+    
     if force_ocr and not engine.available:
         logger.warning("Force OCR requested but PaddleOCR unavailable; falling back to text extraction")
         force_ocr = False
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    page_texts: List[str] = []
-    page_indices = (
-        [idx for idx in select_pages if 0 <= idx < len(doc)]
-        if select_pages
-        else list(range(len(doc)))
-    )
-    scale = max(dpi, 72) / 72 if dpi > 0 else 1.0
-    matrix = fitz.Matrix(scale, scale)
-    for page_index in page_indices:
-        page = doc.load_page(page_index)
-        # Try to extract text using built-in text layer
-        text = "" if force_ocr else page.get_text().strip()
-        if text and not force_ocr:
-            # Split into lines for heading detection
-            lines = text.splitlines()
-            processed = _DETECT_HEADINGS_FN(lines) if detect_headings else [ln.strip() for ln in lines]
-            page_text = "\n".join(processed)
-        else:
-            # If no text layer, fallback to rasterisation and stub OCR
-            pix = page.get_pixmap(alpha=False, matrix=matrix)
-            img_data = pix.tobytes("png")
-            processed = ocr_image_bytes(
-                engine,
-                img_data,
-                min_conf=min_conf,
-                detect_headings=detect_headings,
-            )
-            page_text = "\n".join(processed)
-        page_texts.append(page_text)
-    return page_texts
+    try:
+        # Open PDF document
+        open_start = time.time()
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        open_elapsed = time.time() - open_start
+        total_pages = len(doc)
+        logger.info(f"PDF opened in {open_elapsed:.3f}s - total pages: {total_pages}")
+        
+        page_texts: List[str] = []
+        page_indices = (
+            [idx for idx in select_pages if 0 <= idx < len(doc)]
+            if select_pages
+            else list(range(len(doc)))
+        )
+        logger.info(f"Processing {len(page_indices)} of {total_pages} pages: {page_indices}")
+        
+        scale = max(dpi, 72) / 72 if dpi > 0 else 1.0
+        matrix = fitz.Matrix(scale, scale)
+        
+        text_extraction_time = 0.0
+        ocr_time = 0.0
+        pages_via_text = 0
+        pages_via_ocr = 0
+        
+        for page_num, page_index in enumerate(page_indices, 1):
+            page_start = time.time()
+            logger.info(f"Processing page {page_num}/{len(page_indices)} (PDF page {page_index + 1})")
+            
+            try:
+                page = doc.load_page(page_index)
+                
+                # Try to extract text using built-in text layer
+                extract_start = time.time()
+                text = "" if force_ocr else page.get_text().strip()
+                extract_elapsed = time.time() - extract_start
+                
+                if text and not force_ocr:
+                    # Split into lines for heading detection
+                    text_extraction_time += extract_elapsed
+                    pages_via_text += 1
+                    lines = text.splitlines()
+                    logger.debug(f"Page {page_index + 1}: Extracted {len(lines)} lines via text layer in {extract_elapsed:.3f}s")
+                    
+                    heading_start = time.time()
+                    processed = _DETECT_HEADINGS_FN(lines) if detect_headings else [ln.strip() for ln in lines]
+                    heading_elapsed = time.time() - heading_start
+                    page_text = "\n".join(processed)
+                    logger.info(f"Page {page_index + 1}: Text extraction completed in {extract_elapsed:.3f}s (heading detection: {heading_elapsed:.3f}s)")
+                else:
+                    # If no text layer, fallback to rasterisation and OCR
+                    pages_via_ocr += 1
+                    raster_start = time.time()
+                    pix = page.get_pixmap(alpha=False, matrix=matrix)
+                    img_data = pix.tobytes("png")
+                    raster_elapsed = time.time() - raster_start
+                    logger.info(f"Page {page_index + 1}: Rasterized to {len(img_data)} bytes in {raster_elapsed:.3f}s")
+                    
+                    ocr_start = time.time()
+                    processed = ocr_image_bytes(
+                        engine,
+                        img_data,
+                        min_conf=min_conf,
+                        detect_headings=detect_headings,
+                    )
+                    page_ocr_elapsed = time.time() - ocr_start
+                    ocr_time += page_ocr_elapsed
+                    page_text = "\n".join(processed)
+                    logger.info(f"Page {page_index + 1}: OCR completed in {page_ocr_elapsed:.3f}s - extracted {len(processed)} lines")
+                
+                page_texts.append(page_text)
+                page_elapsed = time.time() - page_start
+                logger.info(f"Page {page_index + 1}: Total processing time: {page_elapsed:.3f}s")
+                
+            except Exception as exc:
+                page_elapsed = time.time() - page_start
+                logger.error(f"Error processing page {page_index + 1} after {page_elapsed:.3f}s: {exc}", exc_info=True)
+                # Append empty text on error to maintain page count
+                page_texts.append("")
+                continue
+        
+        total_elapsed = time.time() - start_time
+        logger.info("=" * 80)
+        logger.info(f"PDF processing completed in {total_elapsed:.3f}s")
+        logger.info(f"  Pages processed: {len(page_texts)}")
+        logger.info(f"  Pages via text extraction: {pages_via_text} (total: {text_extraction_time:.3f}s)")
+        logger.info(f"  Pages via OCR: {pages_via_ocr} (total: {ocr_time:.3f}s)")
+        logger.info("=" * 80)
+        
+        return page_texts
+        
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        logger.error(f"Fatal error in pdf_to_pages after {elapsed:.3f}s: {exc}", exc_info=True)
+        raise
 
 
 def image_to_text(
@@ -184,22 +302,41 @@ def image_to_text(
         The OCR engine instance.
     file_bytes : bytes
         Raw bytes of the image file.
+    min_conf : float
+        Minimum confidence threshold
+    detect_headings : bool
+        Whether to detect headings
 
     Returns
     -------
     str
         Recognised text (with heading markers) joined by newlines.
     """
+    start_time = time.time()
+    logger.info(f"Starting image_to_text processing (image size: {len(file_bytes)} bytes)")
+    
     if not engine.available:
-        raise RuntimeError("OCR engine unavailable")
+        error_msg = "OCR engine unavailable"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
-    lines = ocr_image_bytes(
-        engine,
-        file_bytes,
-        min_conf=min_conf,
-        detect_headings=detect_headings,
-    )
-    return "\n".join(lines)
+    try:
+        lines = ocr_image_bytes(
+            engine,
+            file_bytes,
+            min_conf=min_conf,
+            detect_headings=detect_headings,
+        )
+        result = "\n".join(lines)
+        
+        total_elapsed = time.time() - start_time
+        logger.info(f"image_to_text completed in {total_elapsed:.3f}s - returned {len(lines)} lines, {len(result)} characters")
+        return result
+        
+    except Exception as exc:
+        elapsed = time.time() - start_time
+        logger.error(f"Error in image_to_text after {elapsed:.3f}s: {exc}", exc_info=True)
+        raise
 
 
 def build_response(page_texts: List[str]) -> Dict[str, Union[int, List[Dict[str, Union[int, str]]], str]]:

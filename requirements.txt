@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-PyMuPDF
-numpy
-pillow
-python-multipart
-paddleocr
-httpx

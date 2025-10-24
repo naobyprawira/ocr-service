@@ -1,2 +1,8 @@
 .venv
+.2venv
 temp
+logs/
+*.log
+tests/
+app/__pycache__/
+__pycache__/
